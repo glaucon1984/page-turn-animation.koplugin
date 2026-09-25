@@ -38,6 +38,7 @@ local function clearArm(state)
     freeBuffer(state.old_bb)
     state.old_bb = nil
     state.direction = nil
+    state.chapter_change = nil
     state.armed = false
 end
 
@@ -59,6 +60,8 @@ local function cancelAnimations(state, reason)
     end
     state.animations = {}
     state.latest_animation = nil
+    state.chapter_full_refresh_pending = false
+    state.markers = {}
     freeBuffer(state.base_bb)
     state.base_bb = nil
 
@@ -75,11 +78,32 @@ local function decrementInterceptedRefresh()
     end
 end
 
-local function settle(screen, config)
+-- Reveal steps are queued on the E-Ink controller asynchronously and can
+-- still be in flight after the last one was submitted. The framebuffer only
+-- waits for the most recent marker before a flashing update, which is not
+-- enough with many steps: earlier strips may complete later than the last
+-- one. Wait for every marker the animation submitted so the flash starts
+-- after the animation visibly finished. Falls back to the last marker only
+-- on devices without per-marker waits.
+local function waitForAnimationUpdates(screen, markers)
+    markers = markers or {}
+    if type(screen.mech_wait_update_complete) == "function" then
+        for i = 1, #markers - 1 do
+            local marker = markers[i]
+            if marker ~= screen.dont_wait_for_marker then
+                pcall(screen.mech_wait_update_complete, screen, marker)
+            end
+        end
+    end
+    if screen.refreshWaitForLast then screen:refreshWaitForLast() end
+end
+
+local function settle(screen, config, markers)
     local w, h = screen.bb:getWidth(), screen.bb:getHeight()
     if config.full_refresh and screen.refreshFull then
         -- Strong cleanup option for aggressive waveforms such as A2. This is
         -- deliberately stronger than the normal AUTO/UI settle and may flash.
+        waitForAnimationUpdates(screen, markers)
         screen:refreshFull(0, 0, w, h)
     elseif screen.refreshUI then
         -- Default behavior: one full-screen UI/AUTO settle after the reveal.
@@ -90,7 +114,7 @@ local function settle(screen, config)
     if screen.refreshWaitForLast then screen:refreshWaitForLast() end
 end
 
-local function submitRegion(waveform, x, y, w, h)
+local function submitRegion(state, waveform, x, y, w, h)
     if not x or not y or not w or not h or w <= 0 or h <= 0 then return end
     if waveform == "a2" then
         Screen:refreshA2(x, y, w, h)
@@ -98,6 +122,11 @@ local function submitRegion(waveform, x, y, w, h)
         Screen:refreshFast(x, y, w, h)
     else
         Screen:refreshUI(x, y, w, h)
+    end
+    -- mxcfb-style framebuffers expose the marker of the update just sent.
+    local marker = Screen.marker
+    if type(marker) == "number" and marker ~= state.markers[#state.markers] then
+        state.markers[#state.markers + 1] = marker
     end
 end
 
@@ -135,8 +164,14 @@ local function finishSequence(state)
     local latest = state.latest_animation
     local config = latest and latest.config or {}
     local result = latest and latest.result or nil
+    local settle_config = {
+        full_refresh = config.full_refresh or state.chapter_full_refresh_pending or false,
+    }
+    local markers = state.markers
+    state.markers = {}
     state.base_bb = nil
     state.latest_animation = nil
+    state.chapter_full_refresh_pending = false
     state.suppress = false
 
     -- Async frames run outside UIManager's paint pass. Re-enter the framebuffer
@@ -145,7 +180,7 @@ local function finishSequence(state)
     local ok, why = pcall(function()
         Screen:beforePaint()
         restoreBuffer(Screen, final_bb)
-        settle(Screen, config)
+        settle(Screen, settle_config, markers)
         Screen:afterPaint()
     end)
     state.bypass = false
@@ -217,6 +252,7 @@ local function runAnimationStep(state, Renderer, animation)
         renderStack(state, Renderer)
         if frame.dirty then
             submitRegion(
+                state,
                 animation.waveform,
                 frame.dirty.x,
                 frame.dirty.y,
@@ -248,6 +284,25 @@ local function runAnimationStep(state, Renderer, animation)
     end
 end
 
+-- Chapter membership of a page, as KOReader's own chapter navigation sees it:
+-- the index of the ToC entry in effect on that page, skipping ToC depths the
+-- user hid from the chapter markers. Any failure is treated as "unknown".
+local function tocIndexForPage(toc, pageno)
+    if type(pageno) ~= "number" then return nil end
+    local ok, index = pcall(toc.getTocIndexByPage, toc, pageno, true)
+    if ok then return index end
+    logger.dbg("PageTurnAnimation: ToC lookup failed for page", pageno, index)
+    return nil
+end
+
+-- True when a one-page turn from `before` to `after` crosses a ToC boundary in
+-- either direction. Documents without a ToC never report a chapter change.
+local function isChapterChange(owner, before, after)
+    local toc = owner.ui and owner.ui.toc
+    if not toc or type(toc.getTocIndexByPage) ~= "function" then return false end
+    return tocIndexForPage(toc, before) ~= tocIndexForPage(toc, after)
+end
+
 function Hook.augment(PageTurnAnimation, Renderer)
     local state = Screen._pageturnanimation_page_turn_hook
     if not state then
@@ -260,6 +315,13 @@ function Hook.augment(PageTurnAnimation, Renderer)
             base_bb = nil,
             old_bb = nil,
             direction = nil,
+            -- Set while armed when the pending turn lands in another chapter.
+            chapter_change = nil,
+            -- Set once such a turn has been intercepted, until the whole
+            -- animation stack settles or is cancelled.
+            chapter_full_refresh_pending = false,
+            -- Markers of the reveal updates submitted by the current stack.
+            markers = {},
             armed = false,
             -- Suppresses the rest of the original repaint's refresh queue.
             -- It is cleared by afterPaint; animation callbacks use bypass.
@@ -285,11 +347,14 @@ function Hook.augment(PageTurnAnimation, Renderer)
                     state.old_bb = screen.bb:copy()
                 end
                 state.direction = owner._pageturnanimation_pending_direction
+                state.chapter_change = owner._pageturnanimation_pending_chapter_change == true
                 owner._pageturnanimation_pending_direction = nil
+                owner._pageturnanimation_pending_chapter_change = nil
                 owner._pageturnanimation_force_once = nil
                 state.armed = true
                 state.suppress = false
                 logger.info("PageTurnAnimation: armed reveal, direction", state.direction,
+                    "chapter change", state.chapter_change,
                     "active layers", #state.animations)
             end
             return state.original_beforePaint(screen, ...)
@@ -353,8 +418,10 @@ function Hook.augment(PageTurnAnimation, Renderer)
                 local old_bb = state.old_bb
                 local new_bb = screen.bb:copy()
                 local direction = state.direction or 1
+                local chapter_change = state.chapter_change == true
                 state.old_bb = nil
                 state.direction = nil
+                state.chapter_change = nil
                 state.armed = false
                 state.suppress = true
 
@@ -362,6 +429,8 @@ function Hook.augment(PageTurnAnimation, Renderer)
                     "direction", direction, "shape", config.shape,
                     "waveform", config.waveform, "scheduler", config.scheduler,
                     "delay_ms", config.delay_ms, "full_refresh", config.full_refresh,
+                    "chapter_mode", config.chapter_mode,
+                    "chapter change", chapter_change,
                     "previous layers", #state.animations)
 
                 -- The renderer now produces one overlay layer. The stack owns
@@ -396,6 +465,11 @@ function Hook.augment(PageTurnAnimation, Renderer)
                 animation.done = false
                 state.animations[#state.animations + 1] = animation
                 state.latest_animation = animation
+                if chapter_change then
+                    -- Remembered on the stack, not the layer: a quick second
+                    -- turn stacked on top must not lose the chapter cleanup.
+                    state.chapter_full_refresh_pending = true
+                end
 
                 -- The original paint has put the destination page in RAM. Put
                 -- the composited old/current layers back until the new layer's
@@ -442,9 +516,28 @@ function Hook.augment(PageTurnAnimation, Renderer)
             end
 
             local result = original(nav_self, diff, no_page_turn)
-            if eligible and before ~= nil and nav_self.current_page ~= nil and before == nav_self.current_page then
+            local after = nav_self.current_page
+            owner._pageturnanimation_pending_chapter_change = nil
+            if eligible and before ~= nil and after ~= nil and before == after then
                 owner._pageturnanimation_pending_direction = nil
                 owner._pageturnanimation_force_once = nil
+            elseif eligible and owner.chapter_mode ~= "animate" and owner.chapter_mode ~= nil then
+                -- Only consulted when a chapter mode is on: the ToC lookup is
+                -- cheap but not free, and it would be wasted otherwise.
+                if isChapterChange(owner, before, after) then
+                    if owner.chapter_mode == "flash" then
+                        -- No animation at all: leave the repaint alone so it
+                        -- reaches the panel untouched, and promote it to a
+                        -- flashing full refresh exactly like KOReader's own
+                        -- chapter-boundary flash does.
+                        owner._pageturnanimation_pending_direction = nil
+                        owner._pageturnanimation_force_once = nil
+                        logger.info("PageTurnAnimation: chapter boundary, flashing instead of animating")
+                        UIManager:setDirty(nil, "full")
+                    else
+                        owner._pageturnanimation_pending_chapter_change = true
+                    end
+                end
             end
             return result
         end
@@ -470,6 +563,7 @@ function Hook.augment(PageTurnAnimation, Renderer)
     local old_close = PageTurnAnimation.onCloseDocument
     function PageTurnAnimation:onCloseDocument(...)
         self._pageturnanimation_pending_direction = nil
+        self._pageturnanimation_pending_chapter_change = nil
         self._pageturnanimation_force_once = nil
         if state.owner == self then
             cancelAnimations(state, "document closed")

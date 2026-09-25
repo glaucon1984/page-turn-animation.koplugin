@@ -21,7 +21,7 @@ For a normal one-page turn:
 3. The destination is revealed in a configurable number of temporal steps: **3, 6, 12, 18, or 24**. The default remains **6**.
 4. Each step submits only **one E-Ink update**. Straight mode uses a full-height strip. Shaped modes calculate the edge in 24 horizontal bands in RAM, then refresh one bounding rectangle around all newly revealed pixels.
 5. After the animation the exact destination framebuffer is restored.
-6. Normally one full-screen `refreshUI()` / AUTO settle is performed. Optionally, **Full clean refresh afterwards** replaces that settle with `refreshFull()` for stronger ghost cleanup.
+6. Normally one full-screen `refreshUI()` / AUTO settle is performed. Optionally, **Full clean refresh afterwards** replaces that settle with `refreshFull()` for stronger ghost cleanup. Before a flashing settle the plugin waits for every reveal update it submitted to finish on the panel, so the flash starts after the animation visibly ends. The **New chapter** setting can limit the cleanup to chapter boundaries, or replace the animation there with a plain flash.
 
 ### Rapid consecutive turns
 
@@ -104,6 +104,20 @@ Disabled by default.
 - **Off:** after the configured reveal updates, restore the exact destination and perform a full-screen `refreshUI()` / AUTO settle.
 - **On:** restore the exact destination and call full-screen `refreshFull()` instead. This is intended for aggressive modes such as A2 when ghost cleanup matters more than the extra latency or visible flash.
 
+Reveal updates are queued on the E-Ink controller asynchronously, and with many animation steps the panel is still drawing strips after the last one was submitted. Before a flashing `refreshFull()` the plugin therefore waits for every marker it submitted (not only the most recent one, which is all the framebuffer driver checks on its own), so the flash begins after the animation visibly finished. This wait blocks the UI loop for the remaining panel time, which is why the flashing settle is slower than the plain UI settle.
+
+### New chapter
+
+Chooses what happens when a one-page turn lands in a different chapter, in either direction. Every other page turn is unaffected.
+
+- **Animate like any other page (default):** chapter boundaries are treated like any other page turn.
+- **Animate, then full clean refresh:** play the animation, wait for the panel to finish every reveal step, then settle with full-screen `refreshFull()` instead of the UI/AUTO settle. Clears accumulated ghosting a few times per book without flashing on every page, at the cost of a slower chapter turn. If a second turn is stacked on top of a chapter turn before it finishes, the cleanup is still performed once the whole stack settles.
+- **Refresh instead of animating:** skip the animation entirely on chapter boundaries. The plugin leaves the page repaint alone and promotes it to a flashing full refresh, exactly like KOReader's own **Always flash on chapter boundaries** option does. This is the fastest way to get a clean screen; the flash itself acts as the chapter-change transition. A reveal that is still running when the boundary is crossed is cancelled by the flash.
+
+A chapter is a table-of-contents entry, using the same view of the ToC as KOReader's chapter navigation and progress-bar markers: ToC depths hidden with **Progress bars → chapter markers** are ignored here too. Documents without a ToC never trigger it.
+
+Note that KOReader's own **Always flash on chapter boundaries** and its periodic full refresh are requests for a full refresh on the intercepted page repaint, which this plugin replaces with its own animation and settle. Use this setting (or **Full clean refresh afterwards**) to get a full refresh on animated turns.
+
 ## Menu
 
 1. **Animate normal page turns**
@@ -114,6 +128,7 @@ Disabled by default.
    - Animation steps
    - Strip delay
    - Full clean refresh afterwards
+   - New chapter
 3. **Test animated next page**
 4. **Test animated previous page**
 5. **update plugin**

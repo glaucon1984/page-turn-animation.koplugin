@@ -29,6 +29,11 @@ function Menu.augment(PageTurnAnimation, radioItem)
         end
         local saved_full_refresh = G_reader_settings:readSetting("pageturnanimation_strip_full_refresh")
         self.strip_full_refresh = saved_full_refresh == true
+        self.chapter_mode = G_reader_settings:readSetting("pageturnanimation_chapter_mode") or "animate"
+        if self.chapter_mode ~= "animate" and self.chapter_mode ~= "full_refresh"
+                and self.chapter_mode ~= "flash" then
+            self.chapter_mode = "animate"
+        end
         local saved_auto = G_reader_settings:readSetting("pageturnanimation_auto_page_turn")
         self.auto_page_turn = saved_auto == nil and true or saved_auto == true
         self:onPageTurnAnimationRegisterActions()
@@ -52,6 +57,7 @@ function Menu.augment(PageTurnAnimation, radioItem)
             delay_ms = self.page_delay_ms,
             steps = self.page_steps,
             full_refresh = self.strip_full_refresh,
+            chapter_mode = self.chapter_mode,
         }
     end
 
@@ -146,6 +152,27 @@ function Menu.augment(PageTurnAnimation, radioItem)
                     self:setPageSetting("strip_full_refresh", not self.strip_full_refresh)
                 end,
                 help_text = _("After the animation, force a full-screen refreshFull() cleanup. Useful with A2 ghosting, but slower and may visibly flash. When disabled, the normal full-screen UI settle is still used."),
+            },
+            {
+                text = _("New chapter"),
+                help_text = _("What to do when a one-page turn lands in a different chapter. Chapters follow the document's table of contents, honoring the ToC depths hidden from the chapter markers. Other page turns are not affected."),
+                sub_item_table = {
+                    settingRadio(self, _("Animate like any other page (default)"), "chapter_mode", "animate"),
+                    {
+                        text = _("Animate, then full clean refresh"),
+                        radio = true,
+                        checked_func = function() return self.chapter_mode == "full_refresh" end,
+                        callback = function() self:setPageSetting("chapter_mode", "full_refresh") end,
+                        help_text = _("Play the animation, wait for the panel to finish every reveal step, then do a full-screen refreshFull() cleanup instead of the normal UI settle. Clears ghosting a few times per book, at the cost of a slower chapter turn."),
+                    },
+                    {
+                        text = _("Refresh instead of animating"),
+                        radio = true,
+                        checked_func = function() return self.chapter_mode == "flash" end,
+                        callback = function() self:setPageSetting("chapter_mode", "flash") end,
+                        help_text = _("Skip the animation on chapter boundaries and let KOReader draw the new page with a plain flashing full refresh, like its own \"Always flash on chapter boundaries\" option. Fastest way to clean the screen; the flash itself marks the chapter change."),
+                    },
+                },
             },
         }
     end
